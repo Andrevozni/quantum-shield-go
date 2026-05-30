@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quantum-shield-config
+  namespace: quantum-shield
+  labels:
+    app.kubernetes.io/name: quantum-shield
+data:
+  LISTEN_ADDR:          ":8080"
+  LOG_LEVEL:            "INFO"
+  ALLOWED_ORIGINS:      ""
+  TLS_AUTO_SELF_SIGNED: "false"
+  TLS_MIN_VERSION:      "1.3"
+  REVOCATION_FILE:      "/data/revocation.json"
+  KEYSTORE_PATH:        "/data/keystore.qsk"
+  CA_STORE_PATH:        "/data/ca.qsc"
+  # Raft cluster — set per-pod via StatefulSet ordinal (see statefulset.yaml)
+  QS_CLUSTER_ENABLED:   "true"
+  QS_CLUSTER_DATA_DIR:  "/data/raft"

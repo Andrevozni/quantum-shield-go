@@ -1,0 +1,17 @@
+# PodDisruptionBudget — guarantees Raft quorum during node maintenance.
+#
+# With 3 nodes, quorum = 2.  At most 1 pod can be unavailable at a time.
+# This prevents kubectl drain from evicting 2 pods simultaneously
+# (which would lose quorum and stop all writes).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: quantum-shield-pdb
+  namespace: quantum-shield
+  labels:
+    app.kubernetes.io/name: quantum-shield
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quantum-shield

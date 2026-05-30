@@ -1,0 +1,32 @@
+{
+  "name": "@quantum-shield/client",
+  "version": "0.1.0",
+  "description": "JavaScript/TypeScript SDK for the QuantumShield post-quantum cryptography API",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types":   "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build":   "tsup src/index.ts --format cjs,esm --dts",
+    "test":    "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint":    "eslint src tests"
+  },
+  "keywords": ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "pqc", "fips", "quantum-safe"],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "tsup":     "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest":   "^1.6.0"
+  },
+  "engines": { "node": ">=18" }
+}

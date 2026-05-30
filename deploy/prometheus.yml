@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Single-node (default profile)
+  - job_name: quantum-shield
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+        labels:
+          instance: single-node
+
+  # 3-node cluster (--profile cluster)
+  - job_name: quantum-shield-cluster
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "qs-node1:8080"
+          - "qs-node2:8080"
+          - "qs-node3:8080"
+        labels:
+          cluster: quantum-shield

@@ -1,0 +1,187 @@
+# QuantumShield StatefulSet — 3-node Raft cluster
+#
+# StatefulSet (not Deployment) because:
+#   1. Stable network identity: qs-0, qs-1, qs-2 via Headless Service
+#   2. Ordered rolling updates (node 2 first, then 1, then 0)
+#   3. PersistentVolumeClaim per pod for Raft log + CA store + keystore
+#
+# Apply order:
+#   kubectl apply -f namespace.yaml
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f configmap.yaml
+#   kubectl apply -f service.yaml
+#   kubectl apply -f statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: quantum-shield
+  namespace: quantum-shield
+  labels:
+    app.kubernetes.io/name: quantum-shield
+    app.kubernetes.io/component: api
+spec:
+  serviceName: quantum-shield-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quantum-shield
+  # Ordered shutdown — leader steps down before followers stop.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Update one pod at a time (maintain quorum: 2/3 running during update).
+      maxUnavailable: 1
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quantum-shield
+        app.kubernetes.io/component: api
+      annotations:
+        # Re-roll pods when the secret changes.
+        checksum/secret: "update-me-with-sha256-of-secret-file"
+    spec:
+      # Give the pod up to 35 s to drain (matches HTTP shutdown timeout + buffer).
+      terminationGracePeriodSeconds: 35
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    65534
+        runAsGroup:   65534
+        fsGroup:      65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: quantum-shield
+          image: quantum-shield:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: raft
+              containerPort: 7000
+              protocol: TCP
+
+          # ── Environment from ConfigMap ──────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: quantum-shield-config
+
+          # ── Per-pod env (node identity for Raft) ───────────────────────────
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+            # Raft node ID = pod name (quantum-shield-0, -1, -2)
+            - name: QS_CLUSTER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            # Raft bind address = <pod-name>.quantum-shield-headless.<namespace>:7000
+            - name: QS_CLUSTER_BIND_ADDR
+              value: "$(POD_NAME).quantum-shield-headless.$(POD_NAMESPACE).svc.cluster.local:7000"
+
+            # Bootstrap: only node 0 bootstraps; others join via node 0.
+            # Note: this is a simplification — production should use a separate
+            # init container or cluster-join sidecar.
+            - name: QS_CLUSTER_JOIN_ADDR
+              value: "quantum-shield-0.quantum-shield-headless.$(POD_NAMESPACE).svc.cluster.local:7000"
+
+            # Secrets from Kubernetes Secret
+            - name: BOOTSTRAP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: quantum-shield-secrets
+                  key:  bootstrap-secret
+            - name: KEYSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: quantum-shield-secrets
+                  key:  keystore-password
+            - name: CA_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: quantum-shield-secrets
+                  key:  ca-store-password
+
+          # ── Probes ─────────────────────────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds:       15
+            timeoutSeconds:       5
+            failureThreshold:     3
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds:  5
+            periodSeconds:       10
+            timeoutSeconds:       5
+            failureThreshold:     3
+
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds:  5
+            periodSeconds:        5
+            failureThreshold:    12   # 60 s total start budget
+
+          # ── Resources ──────────────────────────────────────────────────────
+          resources:
+            requests:
+              cpu:    "250m"
+              memory: "256Mi"
+            limits:
+              cpu:    "1000m"
+              memory: "512Mi"
+
+          # ── Security context ───────────────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem:   true
+            capabilities:
+              drop: [ALL]
+
+          # ── Volume mounts ──────────────────────────────────────────────────
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # In-memory tmpfs for /tmp (scratch image has no /tmp).
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+  # ── PersistentVolumeClaim per pod ──────────────────────────────────────────
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: quantum-shield
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+        # Uncomment to use a specific StorageClass:
+        # storageClassName: fast-ssd

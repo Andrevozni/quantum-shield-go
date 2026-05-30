@@ -1,0 +1,1651 @@
+openapi: "3.1.0"
+
+info:
+  title: QuantumShield API
+  version: "2.0.0"
+  description: |
+    Post-quantum cryptography platform implementing NIST FIPS 203/204/205.
+
+    ## Authentication
+
+    Most endpoints require a **QST (QuantumShield Token)** issued by
+    `POST /auth/token`. Pass it as:
+
+    ```
+    Authorization: Bearer <token>
+    ```
+
+    Tokens carry a `roles` claim. Each endpoint documents the minimum role
+    required (`read`, `write`, or `admin`).
+
+    ## Algorithms
+
+    | Standard | Algorithm | Library |
+    |----------|-----------|---------|
+    | NIST FIPS 203 | ML-KEM-768 / 1024 | Go stdlib `crypto/mlkem` |
+    | NIST FIPS 204 | ML-DSA-44 / 65 / 87 | `cloudflare/circl` |
+    | NIST FIPS 205 | SLH-DSA-SHA2-* | `trailofbits/go-slh-dsa` |
+
+    ## Security constraint
+
+    All examples use neutral/generic identifiers.
+    Do not embed organisation-specific data in API payloads.
+
+  contact:
+    name: QuantumShield Project
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development (plain HTTP)
+  - url: https://localhost:8443
+    description: Local development (TLS)
+
+# ── Security ──────────────────────────────────────────────────────────────────
+security: []   # most endpoints define their own security requirement
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        QST (QuantumShield Token) obtained from POST /auth/token.
+        Carries `sub` (user ID) and `roles` (string array) claims.
+
+  # ── Reusable schemas ────────────────────────────────────────────────────────
+  schemas:
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "Key not found"
+
+    Token:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          description: Signed QST bearer token (ML-DSA-65 + HMAC-SHA256 envelope).
+        expires_at:
+          type: integer
+          description: Unix timestamp (seconds) when the token expires.
+
+    Certificate:
+      type: object
+      description: Post-quantum certificate signed with ML-DSA-87 (NIST FIPS 204).
+      required: [version, serial, subject, issuer, algorithm, public_key,
+                 public_key_type, not_before, not_after, is_ca, signature]
+      properties:
+        version:
+          type: integer
+          example: 1
+        serial:
+          type: string
+          description: 32-hex-char (128-bit) random serial number.
+          example: "3a7f2b1c9d4e5f0a8b6c2d1e7f3a4b5c"
+        subject:
+          type: string
+          example: "CN=server.example.com,O=Example Corp"
+        issuer:
+          type: string
+          example: "CN=Root CA,O=Example Corp"
+        algorithm:
+          type: string
+          enum: [ML-DSA-87]
+        public_key:
+          type: string
+          format: byte
+          description: Base64-encoded subject public key bytes.
+        public_key_type:
+          type: string
+          description: Algorithm of the subject's public key.
+          example: "ML-KEM-768"
+        not_before:
+          type: string
+          format: date-time
+        not_after:
+          type: string
+          format: date-time
+        is_ca:
+          type: boolean
+        signature:
+          type: string
+          format: byte
+          description: Base64 ML-DSA-87 signature over all other fields.
+
+    CRLEntry:
+      type: object
+      required: [serial, revoked_at]
+      properties:
+        serial:
+          type: string
+          example: "3a7f2b1c9d4e5f0a8b6c2d1e7f3a4b5c"
+        revoked_at:
+          type: string
+          format: date-time
+
+    CRL:
+      type: object
+      required: [version, issuer, this_update, entries]
+      properties:
+        version:
+          type: integer
+          example: 1
+        issuer:
+          type: string
+          example: "CN=Root CA,O=Example Corp"
+        this_update:
+          type: string
+          format: date-time
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/CRLEntry"
+
+    WrappedKey:
+      type: object
+      description: AES-256-GCM wrapped private key envelope (Argon2id key derivation).
+      required: [version, algorithm, level, kdf, salt, nonce, wrapped_key, public_key]
+      properties:
+        version:
+          type: integer
+          example: 1
+        algorithm:
+          type: string
+          enum: [ML-KEM-768, ML-KEM-1024]
+        level:
+          type: integer
+          enum: [768, 1024]
+        kdf:
+          type: string
+          enum: [argon2id]
+        salt:
+          type: string
+          format: byte
+          description: Base64 random 32-byte Argon2id salt.
+        nonce:
+          type: string
+          format: byte
+          description: Base64 random 12-byte AES-GCM nonce.
+        wrapped_key:
+          type: string
+          format: byte
+          description: Base64 AES-256-GCM ciphertext of the private key seed.
+        public_key:
+          type: string
+          format: byte
+          description: Base64 encapsulation key (stored in plaintext — it is public).
+
+    EncryptedPayload:
+      type: object
+      required: [kem_ciphertext, nonce, data, created_at]
+      properties:
+        kem_ciphertext:
+          type: string
+          format: byte
+        nonce:
+          type: string
+          format: byte
+        data:
+          type: string
+          format: byte
+        created_at:
+          type: integer
+          description: Unix nanosecond timestamp bound into the AEAD tag.
+
+    Shard:
+      type: object
+      required: [index, value, checksum]
+      properties:
+        index:
+          type: integer
+        value:
+          type: string
+          format: byte
+        checksum:
+          type: string
+          format: byte
+
+    PartialSignature:
+      type: object
+      required: [signer_id, public_key, signature, nonce]
+      properties:
+        signer_id:
+          type: string
+        public_key:
+          type: string
+          format: byte
+        signature:
+          type: string
+          format: byte
+        nonce:
+          type: string
+          format: byte
+
+  # ── Reusable responses ───────────────────────────────────────────────────────
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Token lacks the required role.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Requested resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Invalid request body or parameters.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: Required subsystem (keystore, CA) not configured.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+paths:
+
+  # ── Health ──────────────────────────────────────────────────────────────────
+  /:
+    get:
+      tags: [Health]
+      summary: Service info
+      description: Returns service name, version, algorithm table, and operational status.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                service: "QuantumShield API"
+                version: "2.0.0"
+                status: "operational"
+                algorithms:
+                  kem: "ML-KEM-768 (crypto/mlkem — Go stdlib)"
+                  signature: "ML-DSA-65 (cloudflare/circl)"
+                  slh_dsa: "SLH-DSA-SHA2 (Trail of Bits go-slh-dsa)"
+                  symmetric: "AES-256-GCM (crypto/cipher — Go stdlib)"
+
+  /health/live:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Returns 200 as long as the process is running. Used by container orchestrators.
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              example:
+                status: "alive"
+
+  /health/ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: >
+        Returns 200 when the audit chain is intact and the server is ready to serve
+        traffic. Returns 503 if the audit chain is corrupt.
+      responses:
+        "200":
+          description: Ready
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /health/fips:
+    get:
+      tags: [Health]
+      summary: FIPS 140-3 compliance status
+      description: >
+        Reports whether each cryptographic component satisfies its NIST FIPS standard.
+        All components are always FIPS-compliant in a standard build; this endpoint
+        is provided for automated compliance auditing.
+      responses:
+        "200":
+          description: FIPS status
+          content:
+            application/json:
+              example:
+                fips_compliant: true
+                components:
+                  kem: {standard: "FIPS 203", algorithm: "ML-KEM-768", compliant: true}
+                  dsa: {standard: "FIPS 204", algorithm: "ML-DSA-65", compliant: true}
+                  slh_dsa: {standard: "FIPS 205", algorithm: "SLH-DSA-SHA2-128f", compliant: true}
+                  aes: {standard: "FIPS 197", algorithm: "AES-256-GCM", compliant: true}
+                  kdf: {standard: "SP 800-132", algorithm: "Argon2id + HKDF-SHA256", compliant: true}
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      description: >
+        Returns Prometheus text-format metrics including per-route HTTP request
+        counts and latency histograms, crypto operation counters, and audit log size.
+      responses:
+        "200":
+          description: Prometheus text
+          content:
+            text/plain:
+              example: |
+                # HELP qs_http_requests_total Total HTTP requests
+                qs_http_requests_total{method="GET",path="/health/live",status="200"} 42
+
+  # ── Auth ────────────────────────────────────────────────────────────────────
+  /auth/token:
+    post:
+      tags: [Auth]
+      summary: Issue a QST bearer token
+      description: >
+        Issues a signed QuantumShield Token (QST) for the given user.
+        When `BOOTSTRAP_SECRET` is set the request itself must carry that secret
+        as `Authorization: Bearer <secret>` to prevent unauthorised token issuance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, roles]
+              properties:
+                user_id:
+                  type: string
+                  description: Alphanumeric user identifier (max 64 chars).
+                  example: "alice"
+                roles:
+                  type: array
+                  items:
+                    type: string
+                    enum: [read, write, admin]
+                  example: ["read", "write"]
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Token"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Bootstrap secret required but missing or incorrect.
+
+  /auth/verify:
+    post:
+      tags: [Auth]
+      summary: Verify a QST token
+      description: Validates the token signature, expiry, and revocation status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              example:
+                valid: true
+                subject: "alice"
+                roles: ["read", "write"]
+        "401":
+          description: Token invalid or revoked.
+
+  /auth/revoke:
+    post:
+      tags: [Auth]
+      summary: Revoke a QST token
+      description: Adds the token's JTI to the revocation list. Requires a valid token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              example:
+                revoked: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Keys ────────────────────────────────────────────────────────────────────
+  /keys:
+    get:
+      tags: [Keys]
+      summary: List key IDs
+      description: >
+        Returns all key IDs held by the server. When an encrypted keystore is
+        configured the list is read from it; otherwise the in-memory map is used.
+        Requires `read` role.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Key list
+          content:
+            application/json:
+              example:
+                keys: ["Xk9aB3m", "Y7mCd2n"]
+                count: 2
+                backend: "in-memory"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /keys/generate:
+    post:
+      tags: [Keys]
+      summary: Generate an ML-KEM keypair
+      description: >
+        Generates a fresh ML-KEM keypair and stores it server-side. Returns the key ID
+        and base64 encapsulation key (public). Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                level:
+                  type: string
+                  enum: [standard, high]
+                  default: standard
+                  description: "`standard` = ML-KEM-768 (cat 3); `high` = ML-KEM-1024 (cat 5)"
+      responses:
+        "200":
+          description: Key generated
+          content:
+            application/json:
+              example:
+                key_id: "Xk9aB3m"
+                public_key: "<base64>"
+                algorithm: "ML-KEM-768"
+                public_key_size: 1184
+                vault_shards: 5
+                vault_threshold: 3
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /keys/{key_id}/public:
+    get:
+      tags: [Keys]
+      summary: Get public key
+      description: Returns the encapsulation (public) key for the given key ID. Requires `read` role.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Public key
+          content:
+            application/json:
+              example:
+                key_id: "Xk9aB3m"
+                public_key: "<base64>"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /keys/{key_id}/export:
+    post:
+      tags: [Keys]
+      summary: Export (wrap) a private key
+      description: >
+        Wraps the private key seed with AES-256-GCM using an Argon2id-derived wrapping
+        key. The returned envelope is safe to store or transmit. Requires `admin` role.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  description: Password for Argon2id key derivation. Not stored server-side.
+      responses:
+        "200":
+          description: Wrapped key envelope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WrappedKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /keys/import:
+    post:
+      tags: [Keys]
+      summary: Import (unwrap) a private key
+      description: >
+        Unwraps a previously exported key envelope and stores it under `key_id`.
+        Requires `admin` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key_id, password, wrapped]
+              properties:
+                key_id:
+                  type: string
+                  description: ID to assign the imported key.
+                password:
+                  type: string
+                wrapped:
+                  $ref: "#/components/schemas/WrappedKey"
+      responses:
+        "200":
+          description: Key imported
+          content:
+            application/json:
+              example:
+                key_id: "imported-key"
+                public_key: "<base64>"
+                algorithm: "ML-KEM-768"
+                imported: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Crypto ──────────────────────────────────────────────────────────────────
+  /encrypt:
+    post:
+      tags: [Crypto]
+      summary: Encrypt plaintext (ML-KEM-768 + AES-256-GCM)
+      description: >
+        Encapsulates a fresh shared secret with ML-KEM and uses it as the AES-256-GCM
+        key to encrypt the plaintext. Either `key_id` or `public_key` must be provided.
+        Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key_id:
+                  type: string
+                public_key:
+                  type: string
+                  format: byte
+                plaintext:
+                  type: string
+      responses:
+        "200":
+          description: Encrypted payload
+          content:
+            application/json:
+              example:
+                encrypted:
+                  kem_ciphertext: "<base64>"
+                  nonce: "<base64>"
+                  data: "<base64>"
+                  created_at: 1748476800000000000
+                algorithm: "ML-KEM-768 + AES-256-GCM"
+                quantum_safe: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /decrypt:
+    post:
+      tags: [Crypto]
+      summary: Decrypt ciphertext
+      description: >
+        Decapsulates the shared secret and decrypts the AES-256-GCM ciphertext.
+        `created_at` is required — it was bound into the AEAD tag by `/encrypt`.
+        Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key_id, encrypted]
+              properties:
+                key_id:
+                  type: string
+                encrypted:
+                  $ref: "#/components/schemas/EncryptedPayload"
+      responses:
+        "200":
+          description: Decrypted plaintext
+          content:
+            application/json:
+              example:
+                plaintext: "hello world"
+                verified: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /sign:
+    post:
+      tags: [Crypto]
+      summary: Sign a message (ML-DSA)
+      description: >
+        Generates an ephemeral ML-DSA keypair, signs the message, and returns the
+        signature and public key. Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+                level:
+                  type: string
+                  enum: [light, standard, high]
+                  description: "`light`=ML-DSA-44, `standard`=ML-DSA-65, `high`=ML-DSA-87"
+      responses:
+        "200":
+          description: Signature
+          content:
+            application/json:
+              example:
+                signature: "<base64>"
+                public_key: "<base64>"
+                algorithm: "ML-DSA-65"
+                quantum_safe: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /verify-signature:
+    post:
+      tags: [Crypto]
+      summary: Verify an ML-DSA signature
+      description: Public endpoint — no authentication required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message, signature, public_key]
+              properties:
+                message:
+                  type: string
+                signature:
+                  type: string
+                  format: byte
+                public_key:
+                  type: string
+                  format: byte
+                level:
+                  type: string
+                  enum: [light, standard, high]
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              example:
+                valid: true
+                algorithm: "ML-DSA-65"
+
+  # ── SLH-DSA ─────────────────────────────────────────────────────────────────
+  /slh-dsa/sign:
+    post:
+      tags: [SLH-DSA]
+      summary: Sign a message with SLH-DSA (FIPS 205)
+      description: >
+        Generates an ephemeral SLH-DSA-SHA2 keypair for the requested parameter set
+        and signs the message using hedged (randomised) signing. Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                level:
+                  type: string
+                  enum: ["128f", "128s", "192f", "192s", "256f", "256s"]
+                  default: "128f"
+                  description: >
+                    SLH-DSA parameter set. `f` = fast (larger signature),
+                    `s` = small (slower keygen). Numbers are security bits.
+      responses:
+        "200":
+          description: SLH-DSA signature
+          content:
+            application/json:
+              example:
+                signature: "<base64>"
+                public_key: "<base64>"
+                algorithm: "SLH-DSA-SHA2-128f"
+                signature_size: 17088
+                quantum_safe: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /slh-dsa/verify:
+    post:
+      tags: [SLH-DSA]
+      summary: Verify an SLH-DSA signature
+      description: Public endpoint — no authentication required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message, signature, public_key, level]
+              properties:
+                message:
+                  type: string
+                signature:
+                  type: string
+                  format: byte
+                public_key:
+                  type: string
+                  format: byte
+                level:
+                  type: string
+                  enum: ["128f", "128s", "192f", "192s", "256f", "256s"]
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              example:
+                valid: true
+                algorithm: "SLH-DSA-SHA2-128f"
+
+  # ── Vault ────────────────────────────────────────────────────────────────────
+  /vault/split:
+    post:
+      tags: [Vault]
+      summary: Shamir secret split
+      description: >
+        Splits a secret into `n` shards using Shamir's Secret Sharing over GF(2⁸).
+        Any `threshold` shards reconstruct the secret. Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [secret, n, threshold]
+              properties:
+                secret:
+                  type: string
+                  format: byte
+                  description: Base64-encoded secret (non-empty).
+                n:
+                  type: integer
+                  minimum: 2
+                  maximum: 255
+                threshold:
+                  type: integer
+                  minimum: 2
+      responses:
+        "200":
+          description: Shards
+          content:
+            application/json:
+              example:
+                shards:
+                  - {index: 1, value: "<base64>", checksum: "<base64>"}
+                n: 5
+                threshold: 3
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /vault/reconstruct:
+    post:
+      tags: [Vault]
+      summary: Shamir secret reconstruct
+      description: >
+        Reconstructs a secret from at least `threshold` shards.
+        Checksums are verified before interpolation. Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shards, threshold]
+              properties:
+                shards:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/Shard"
+                threshold:
+                  type: integer
+      responses:
+        "200":
+          description: Reconstructed secret
+          content:
+            application/json:
+              example:
+                secret: "<base64>"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Channel ──────────────────────────────────────────────────────────────────
+  /channel/init:
+    post:
+      tags: [Channel]
+      summary: Initiate an authenticated key-exchange session
+      description: >
+        Generates an ML-KEM encapsulation key and ML-DSA identity keypair for the
+        initiator side of a post-quantum authenticated channel. Requires `write` role.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Initiator handshake material
+          content:
+            application/json:
+              example:
+                session_id: "<uuid>"
+                ek_bytes: "<base64>"
+                identity_pk: "<base64>"
+                signature: "<base64>"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /channel/complete:
+    post:
+      tags: [Channel]
+      summary: Complete the channel handshake
+      description: >
+        Processes the responder's reply and establishes the shared session key.
+        Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, kem_ciphertext, identity_pk, signature]
+              properties:
+                session_id:
+                  type: string
+                kem_ciphertext:
+                  type: string
+                  format: byte
+                identity_pk:
+                  type: string
+                  format: byte
+                signature:
+                  type: string
+                  format: byte
+      responses:
+        "200":
+          description: Session established
+          content:
+            application/json:
+              example:
+                session_id: "<uuid>"
+                status: "established"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /channel/seal:
+    post:
+      tags: [Channel]
+      summary: Seal (encrypt) a message on an established session
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, plaintext]
+              properties:
+                session_id:
+                  type: string
+                plaintext:
+                  type: string
+      responses:
+        "200":
+          description: Sealed message
+          content:
+            application/json:
+              example:
+                session_id: "<uuid>"
+                seq_num: 1
+                ciphertext: "<base64>"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /channel/open:
+    post:
+      tags: [Channel]
+      summary: Open (decrypt) a sealed message
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, seq_num, ciphertext]
+              properties:
+                session_id:
+                  type: string
+                msg_nonce:
+                  type: string
+                  format: byte
+                seq_num:
+                  type: integer
+                ciphertext:
+                  type: string
+                  format: byte
+      responses:
+        "200":
+          description: Decrypted plaintext
+          content:
+            application/json:
+              example:
+                plaintext: "hello"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Threshold ────────────────────────────────────────────────────────────────
+  /threshold/round:
+    post:
+      tags: [Threshold]
+      summary: Open a threshold signing round
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message, threshold]
+              properties:
+                message:
+                  type: string
+                signer_ids:
+                  type: array
+                  items:
+                    type: string
+                threshold:
+                  type: integer
+                  minimum: 1
+      responses:
+        "200":
+          description: Round opened
+          content:
+            application/json:
+              example:
+                round_id: "<hex>"
+                nonce: "<base64>"
+                threshold: 2
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /threshold/sign:
+    post:
+      tags: [Threshold]
+      summary: Produce a partial signature for a round
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signer_id, round_id, nonce, message]
+              properties:
+                signer_id:
+                  type: string
+                round_id:
+                  type: string
+                nonce:
+                  type: string
+                  format: byte
+                message:
+                  type: string
+      responses:
+        "200":
+          description: Partial signature
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PartialSignature"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /threshold/submit:
+    post:
+      tags: [Threshold]
+      summary: Submit a partial signature to a round
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [round_id, signer_id, public_key, signature, nonce]
+              properties:
+                round_id:
+                  type: string
+                signer_id:
+                  type: string
+                public_key:
+                  type: string
+                  format: byte
+                signature:
+                  type: string
+                  format: byte
+                nonce:
+                  type: string
+                  format: byte
+      responses:
+        "200":
+          description: Submit result (done=false until threshold reached)
+          content:
+            application/json:
+              example:
+                done: false
+                round_id: "<hex>"
+                collected: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /threshold/verify:
+    post:
+      tags: [Threshold]
+      summary: Verify an authorised threshold signature
+      description: Public endpoint — no authentication required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message, authorised, trusted]
+              properties:
+                message:
+                  type: string
+                authorised:
+                  type: object
+                  description: AuthorisedSignature JSON produced by /threshold/submit.
+                trusted:
+                  type: object
+                  additionalProperties:
+                    type: string
+                    format: byte
+                  description: "Map of signer_id → base64 public key."
+      responses:
+        "200":
+          description: Verification result
+
+  # ── KDF ──────────────────────────────────────────────────────────────────────
+  /kdf/hkdf:
+    post:
+      tags: [KDF]
+      summary: Derive a key with HKDF-SHA256
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [secret, key_len]
+              properties:
+                secret:
+                  type: string
+                  format: byte
+                salt:
+                  type: string
+                  format: byte
+                info:
+                  type: string
+                key_len:
+                  type: integer
+                  minimum: 1
+                  maximum: 512
+      responses:
+        "200":
+          description: Derived key
+          content:
+            application/json:
+              example:
+                key: "<base64>"
+                key_len: 32
+                algorithm: "HKDF-SHA256"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /kdf/argon2:
+    post:
+      tags: [KDF]
+      summary: Derive a key with Argon2id
+      description: >
+        Parameters: time=2, memory=64 MiB, threads=4, output=32 bytes.
+        These are the same parameters used internally for the keystore master key.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password, salt]
+              properties:
+                password:
+                  type: string
+                  format: byte
+                  description: Base64-encoded password bytes.
+                salt:
+                  type: string
+                  format: byte
+                  description: Base64-encoded salt (minimum 16 bytes).
+      responses:
+        "200":
+          description: Derived key
+          content:
+            application/json:
+              example:
+                key: "<base64>"
+                key_len: 32
+                algorithm: "Argon2id"
+                params: {time: 2, memory_kb: 65536, threads: 4}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /kdf/salt:
+    post:
+      tags: [KDF]
+      summary: Generate a random cryptographic salt
+      description: Returns 32 bytes from `crypto/rand`. Requires `write` role.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Random salt
+          content:
+            application/json:
+              example:
+                salt: "<base64>"
+                size: 32
+                encoding: "base64"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Audit ────────────────────────────────────────────────────────────────────
+  /audit/entries:
+    get:
+      tags: [Audit]
+      summary: Retrieve audit log entries
+      description: Returns all audit log entries with HMAC chain metadata. Requires `read` role.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Audit entries
+          content:
+            application/json:
+              example:
+                entries: []
+                count: 0
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /audit/verify:
+    get:
+      tags: [Audit]
+      summary: Verify audit log chain integrity
+      description: >
+        Recomputes the HMAC chain from the first entry and returns whether the
+        chain is intact. Requires `read` role.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Chain verification result
+          content:
+            application/json:
+              example:
+                valid: true
+                entries: 42
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Keystore ──────────────────────────────────────────────────────────────────
+  /keystore/generate:
+    post:
+      tags: [Keystore]
+      summary: Generate and store an ML-KEM key in the encrypted keystore
+      description: >
+        Requires both KEYSTORE_PATH and KEYSTORE_PASSWORD environment variables and
+        `admin` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key_id]
+              properties:
+                key_id:
+                  type: string
+                level:
+                  type: string
+                  enum: [standard, high]
+      responses:
+        "200":
+          description: Key stored
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /keystore:
+    get:
+      tags: [Keystore]
+      summary: List encrypted keystore key IDs
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Key IDs
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /keystore/{key_id}:
+    get:
+      tags: [Keystore]
+      summary: Get keystore key metadata
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Key metadata (no private key material)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Keystore]
+      summary: Delete a key from the keystore (irreversible)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /keystore/{key_id}/rotate:
+    post:
+      tags: [Keystore]
+      summary: Rotate a keystore key (generate new version, keep old for decryption)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Rotated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /keystore/{key_id}/expire:
+    post:
+      tags: [Keystore]
+      summary: Expire the active keystore key version
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Expired
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── CA ────────────────────────────────────────────────────────────────────────
+  /ca/init:
+    post:
+      tags: [CA]
+      summary: Initialise the post-quantum CA
+      description: >
+        Generates a fresh ML-DSA-87 keypair and creates a self-signed root certificate.
+        Requires `admin` role. Calling again replaces the current CA instance.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject]
+              properties:
+                subject:
+                  type: string
+                  example: "CN=Root CA,O=Example Corp"
+      responses:
+        "200":
+          description: CA initialised with root certificate
+          content:
+            application/json:
+              example:
+                status: "initialised"
+                certificate: {}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /ca/sign:
+    post:
+      tags: [CA]
+      summary: Issue a leaf certificate
+      description: >
+        Signs a new leaf certificate binding the subject identity to the provided
+        public key bytes. Requires `write` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, public_key, public_key_type]
+              properties:
+                subject:
+                  type: string
+                  example: "CN=server.example.com,O=Example Corp"
+                public_key:
+                  type: string
+                  format: byte
+                public_key_type:
+                  type: string
+                  example: "ML-KEM-768"
+                ttl_days:
+                  type: integer
+                  default: 365
+      responses:
+        "200":
+          description: Issued certificate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Certificate"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /ca/revoke:
+    post:
+      tags: [CA]
+      summary: Revoke a certificate by serial number
+      description: >
+        Adds the serial to the in-memory CRL. Subsequent `POST /ca/verify` calls for
+        a certificate with this serial will fail. Requires `admin` role.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [serial]
+              properties:
+                serial:
+                  type: string
+                  example: "3a7f2b1c9d4e5f0a8b6c2d1e7f3a4b5c"
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              example:
+                revoked: true
+                serial: "3a7f2b1c9d4e5f0a8b6c2d1e7f3a4b5c"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /ca/verify:
+    post:
+      tags: [CA]
+      summary: Verify a certificate
+      description: >
+        Public endpoint — no authentication required. Checks validity window,
+        issuer, ML-DSA-87 signature, and CRL status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [certificate]
+              properties:
+                certificate:
+                  $ref: "#/components/schemas/Certificate"
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              example:
+                valid: true
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /ca/certificate:
+    get:
+      tags: [CA]
+      summary: Get the CA root certificate
+      description: >
+        Public endpoint — no authentication required. Returns the CA's self-signed
+        ML-DSA-87 root certificate.
+      responses:
+        "200":
+          description: Root certificate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Certificate"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /ca/crl:
+    get:
+      tags: [CA]
+      summary: Get the Certificate Revocation List
+      description: Public endpoint — no authentication required.
+      responses:
+        "200":
+          description: Current CRL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CRL"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+# ── Tags (display order in docs UIs) ─────────────────────────────────────────
+tags:
+  - name: Health
+    description: Liveness, readiness, FIPS status, and Prometheus metrics.
+  - name: Auth
+    description: QST token issuance, verification, and revocation.
+  - name: Keys
+    description: ML-KEM keypair generation, listing, and export/import.
+  - name: Crypto
+    description: ML-KEM encrypt/decrypt and ML-DSA sign/verify.
+  - name: SLH-DSA
+    description: Hash-based post-quantum signatures (NIST FIPS 205).
+  - name: Vault
+    description: Shamir's Secret Sharing — split and reconstruct.
+  - name: Channel
+    description: Post-quantum authenticated key-exchange sessions.
+  - name: Threshold
+    description: Threshold (t-of-n) signature protocol.
+  - name: KDF
+    description: Key derivation — HKDF-SHA256 and Argon2id.
+  - name: Audit
+    description: HMAC-chained audit log.
+  - name: Keystore
+    description: Encrypted persistent key store (Argon2id + AES-256-GCM).
+  - name: CA
+    description: Post-quantum certificate authority (ML-DSA-87 JSON certs + CRL).

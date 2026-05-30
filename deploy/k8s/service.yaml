@@ -1,0 +1,61 @@
+# ── Headless Service — stable DNS for Raft inter-node communication ───────────
+# Each pod gets a DNS entry:
+#   quantum-shield-0.quantum-shield-headless.<namespace>.svc.cluster.local
+# This is required for Raft peers to find each other by stable name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: quantum-shield-headless
+  namespace: quantum-shield
+  labels:
+    app.kubernetes.io/name:      quantum-shield
+    app.kubernetes.io/component: headless
+spec:
+  clusterIP: None   # headless — no load-balancing, direct pod DNS
+  selector:
+    app.kubernetes.io/name: quantum-shield
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: raft
+      port: 7000
+      targetPort: raft
+---
+# ── ClusterIP Service — internal load-balanced API access ────────────────────
+# Use this from other services inside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: quantum-shield
+  namespace: quantum-shield
+  labels:
+    app.kubernetes.io/name:      quantum-shield
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: quantum-shield
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+# ── LoadBalancer Service — external access (cloud deployments) ────────────────
+# Uncomment for AWS ELB / GCP LB / Azure LB.
+# For production: use an Ingress + cert-manager instead of a LoadBalancer.
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: quantum-shield-lb
+#   namespace: quantum-shield
+# spec:
+#   type: LoadBalancer
+#   selector:
+#     app.kubernetes.io/name: quantum-shield
+#   ports:
+#     - name: https
+#       port: 443
+#       targetPort: 8443

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quantum-shield
+  labels:
+    app.kubernetes.io/name: quantum-shield
+    app.kubernetes.io/part-of: quantum-shield

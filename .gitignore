@@ -1,0 +1,41 @@
+# Binaries
+/server
+/quantum-shield
+/healthcheck
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Runtime data (never commit secrets or Raft state)
+/data/
+*.qsk
+*.qsc
+*.json.tmp
+secrets/
+*.key
+*.crt
+*.pem
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes (created by docker compose)
+prometheus_data/
+grafana_data/

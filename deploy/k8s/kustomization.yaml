@@ -1,0 +1,26 @@
+# Apply everything with:
+#   kubectl apply -k deploy/k8s/
+#
+# Or individually:
+#   kubectl apply -f deploy/k8s/namespace.yaml
+#   kubectl apply -f deploy/k8s/secret.yaml          # edit passwords first!
+#   kubectl apply -f deploy/k8s/configmap.yaml
+#   kubectl apply -f deploy/k8s/service.yaml
+#   kubectl apply -f deploy/k8s/statefulset.yaml
+#   kubectl apply -f deploy/k8s/poddisruptionbudget.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: quantum-shield
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - configmap.yaml
+  - service.yaml
+  - statefulset.yaml
+  - poddisruptionbudget.yaml
+
+commonLabels:
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/version:    dev
