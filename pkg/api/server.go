@@ -34,6 +34,7 @@ import (
 
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/subtle"
 
 	"github.com/quantum-shield/quantum-shield-go/internal/audit"
 	"github.com/quantum-shield/quantum-shield-go/internal/auth"
@@ -703,7 +704,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIssueToken(w http.ResponseWriter, r *http.Request) {
 	if s.bootstrapSecret != "" {
 		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if bearer != s.bootstrapSecret {
+		if subtle.ConstantTimeCompare([]byte(bearer), []byte(s.bootstrapSecret)) != 1 {
 			mw.JSONError(w, "Authentication failed", http.StatusUnauthorized)
 			return
 		}
@@ -2244,9 +2245,15 @@ func (s *Server) handleChannelComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.channelMu.RLock()
+	// Claim the initiator atomically under a write lock.
+	// This prevents two concurrent Complete() calls for the same session:
+	// the first goroutine deletes the entry, so the second sees "not found".
+	s.channelMu.Lock()
 	entry, ok := s.channelInitiators[req.SessionID]
-	s.channelMu.RUnlock()
+	if ok {
+		delete(s.channelInitiators, req.SessionID)
+	}
+	s.channelMu.Unlock()
 	if !ok {
 		mw.JSONError(w, "Session not found", http.StatusNotFound)
 		return
@@ -2270,7 +2277,6 @@ func (s *Server) handleChannelComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.channelMu.Lock()
-	delete(s.channelInitiators, req.SessionID)
 	s.channelSessions[req.SessionID] = &channelSessEntry{
 		sess:     sess,
 		lastUsed: time.Now(),

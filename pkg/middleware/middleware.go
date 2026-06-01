@@ -46,7 +46,10 @@ func RequireJSON(next http.Handler) http.Handler {
 		// Enforce Content-Type on methods that carry a body
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 			ct := r.Header.Get("Content-Type")
-			if ct != "" && !strings.HasPrefix(ct, "application/json") {
+			// Reject missing or non-JSON Content-Type.
+			// Empty Content-Type is also rejected: a browser form POST without
+			// Content-Type could bypass CSRF checks if this were allowed.
+			if ct == "" || !strings.HasPrefix(ct, "application/json") {
 				JSONError(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 				return
 			}

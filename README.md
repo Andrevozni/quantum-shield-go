@@ -337,11 +337,29 @@ QuantumShield assumes:
 
 ### Security tests
 
+8 levels of red team attacks — 148 security tests total:
+
+```
+L1  API auth, RBAC, CA boundaries              12 attacks   PASS
+L2  Type confusion, panic, DoS vectors         12 attacks   PASS
+L3  Crypto guarantees, side-channel            14 attacks   PASS
+L4  Nonce uniqueness, replay, GF(256)          15 attacks   PASS
+L5  Timing oracles, race conditions            11 attacks   PASS  ← 2 real bugs found & fixed
+L6  Fault injection (software), Module-LWE     11 attacks   PASS
+L7  FO-Transform, NTT coefficients, Keccak      6 attacks   PASS
+L8  Infrastructure, concurrent safety          13 attacks   PASS  ← 1 real bug found & fixed
+```
+
+Real vulnerabilities found and fixed during testing:
+- **Timing oracle** — bootstrap secret compared with `==` instead of `subtle.ConstantTimeCompare`
+- **TOCTOU race** — channel handshake check-then-act without atomic lock
+- **Content-Type bypass** — empty header bypassed `RequireJSON` middleware (CSRF vector)
+
 ```bash
 # Standard pentest (54 attacks)
 go test ./test/security/... -v
 
-# Red team attacks (concurrent, type confusion, panic induction)
+# Red team attacks (8 levels, 94 attacks)
 go test ./test/redteam/... -v
 
 # Race detector
@@ -449,7 +467,7 @@ go test ./test/redteam/... -v    # red team attacks
 go test -short ./...             # skip slow tests
 ```
 
-**435 tests, 25 packages, 0 data races.**
+**25 packages, 0 data races. 148 security tests (94 red team + 54 pentest).**
 
 ---
 
